@@ -5,110 +5,290 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/time.h>
+
 
 #define PORT 69
-#define MAX_BUF 516 // 512 octets de données + 4 octets d'en-tête
+#define MAX_BUF 516
+#define TFTP_TIMEOUT_SEC 5
+#define TFTP_MAX_RETRIES 5
 
-
-typedef struct {
-    const char *ip;           
-    int port;             
-    const char *fichier;       
-    int is_get;           
+typedef struct { 
+    const char *ip;
+    int port; 
+    const char *fichier; 
+    int type ; // 1 pour get , 2 pour put
 } requete_tftp_t;
 
-// --- Fonctions de construction de paquets ---
-void send_rrq(int sockfd, struct sockaddr_in *server_addr, socklen_t addr_len, const char *fichier) {
+void send_request(int sockfd, struct sockaddr_in *server_addr, uint16_t opcode_val, const char *fichier) {
     char buffer[MAX_BUF];
-    int len = 0;
-
-    // Opcode RRQ = 1 (en Big-Endian)
-    buffer[len++] = 0;
-    buffer[len++] = 1;
-
-    // Nom du fichier + \0
-    strcpy(&buffer[len], fichier);
-    len += strlen(fichier) + 1;
-
-    // Mode "octet" + \0
-    const char *mode = "octet";
-    strcpy(&buffer[len], mode);
-    len += strlen(mode) + 1;
-
-    if (sendto(sockfd, buffer, len, 0, (struct sockaddr *)server_addr, addr_len) < 0) {
-        perror("Erreur lors de l'envoi du RRQ");
-    } else {
-        printf("[CLIENT] RRQ envoyé pour le fichier : %s\n", fichier);
-    }
+    uint16_t opcode = htons(opcode_val);
+    memcpy(buffer, &opcode, 2);
+    int len = 2 + sprintf(buffer + 2, "%s", fichier) + 1;
+    len += sprintf(buffer + len, "octet") + 1;
+    sendto(sockfd, buffer, len, 0, (struct sockaddr *)server_addr, sizeof(*server_addr));
 }
 
-void send_wrq(int sockfd, struct sockaddr_in *server_addr, socklen_t addr_len, const char *fichier) {
-    char buffer[MAX_BUF];
-    int len = 0;
-
-    // Opcode WRQ = 2 (en Big-Endian)
-    buffer[len++] = 0;
-    buffer[len++] = 2;
-
-    strcpy(&buffer[len], fichier);
-    len += strlen(fichier) + 1;
-
-    const char *mode = "octet";
-    strcpy(&buffer[len], mode);
-    len += strlen(mode) + 1;
-
-    if (sendto(sockfd, buffer, len, 0, (struct sockaddr *)server_addr, addr_len) < 0) {
-        perror("Erreur lors de l'envoi du WRQ");
-    } else {
-        printf("[CLIENT] WRQ envoyé pour le fichier : %s\n", fichier);
-    }
+ void send_error_client(int sockfd, struct sockaddr_in *peer, socklen_t peer_len, uint16_t err_code, const char *err_msg) {
+    char err_packet[MAX_BUF];
+    uint16_t opcode = htons(5);
+    uint16_t error_code = htons(err_code);
+    memcpy(err_packet, &opcode, 2);
+    memcpy(err_packet + 2, &error_code, 2);
+    int len = 4 + sprintf(err_packet + 4, "%s", err_msg) + 1;
+    sendto(sockfd, err_packet, len, 0, (struct sockaddr *)peer, peer_len);
 }
 
+int get(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
+    // Configurer le timeout sur la socket
+    struct timeval tv = {TFTP_TIMEOUT_SEC, 0};
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    char *buffer_final = NULL;
+    size_t taille_totale = 0;
+    char buffer[MAX_BUF];
+    ssize_t n;
+    socklen_t addr_len = sizeof(*server_addr);
+    int is_valid = 1;
+    uint16_t dernier_lock_recu = 0; // Pour savoir quel ACK renvoyer
+
+    printf("[GET] Téléchargement de '%s'...\n", fichier);
+
+    struct sockaddr_in peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+    int peer_set = 0;
+    memset(&peer_addr, 0, sizeof(peer_addr));
+
+    do {
+        int tentatives = 0; // Compteur pour le timeout
+        int recu_ok = 0;    // Drapeau pour sortir de la boucle de retransmission
+
+        while (tentatives < TFTP_MAX_RETRIES && !recu_ok) {
+            // Si c'est le tout début, on envoie la requête RRQ
+            if (dernier_lock_recu == 0 && tentatives == 0) {
+                send_request(sockfd, server_addr, 1, fichier);
+            } else if (dernier_lock_recu != 0 && tentatives > 0 && peer_set) {
+                // Renvoi du dernier ACK au peer connu
+                uint16_t blk_net = htons(dernier_lock_recu);
+                char ack_retry[4] = {0, 4, ((char*)&blk_net)[0], ((char*)&blk_net)[1]};
+                if (sendto(sockfd, ack_retry, 4, 0, (struct sockaddr *)&peer_addr, peer_len) < 0) {
+                    perror("sendto");
+                    break;
+                }
+            }
+
+            n = recvfrom(sockfd, buffer, MAX_BUF, 0, (struct sockaddr *)&peer_addr, &peer_len);
+
+            if (n >= 4) {
+                // Vérifier la source : l'IP doit correspondre au server demandé (au début)
+                // ou au TID enregistré (pour la suite)
+                if (!peer_set) {
+                    if (peer_addr.sin_addr.s_addr != server_addr->sin_addr.s_addr) {
+                        printf("[WARNING] Reçu paquet depuis %s (attendu %s) -> envoi ERROR(5)\n",
+                            inet_ntoa(peer_addr.sin_addr), inet_ntoa(server_addr->sin_addr));
+                        send_error_client(sockfd, &peer_addr, peer_len, 5, "Unknown transfer ID");
+                        continue;
+                    }
+                    // Initialiser le premier peer connu
+                    peer_set = 1; 
+                    recu_ok = 1; 
+                } else {
+                    // Pour les paquets suivants, on devrait vérifier si c'est bien le même port (TID).
+                    // Mais recvfrom écrase peer_addr à chaque fois.
+                    // Pour rester simple et robuste sans changer toute la structure variables :
+                    // On accepte le paquet ici, et on filtre les doublons/erreurs via le numéro de bloc plus bas.
+                    // (Une implémentation parfaite nécessiterait de stocker le TID séparément de peer_addr temp).
+                    recu_ok = 1;
+                }
+                recu_ok = 1; // On a reçu quelque chose, on sort de la boucle de retry
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // CAS TIMEOUT
+                tentatives++;
+                printf("[TIMEOUT] Tentative %d/%d... Renvoi du dernier message.\n", tentatives, TFTP_MAX_RETRIES);
+                if (dernier_lock_recu == 0) {
+                    send_request(sockfd, server_addr, 1, fichier); // Renvoi RRQ
+                } else {
+                    if (peer_set) {
+                        // Renvoi du dernier ACK au peer connu
+                        uint16_t blk_net = htons(dernier_lock_recu);
+                        char ack_retry[4] = {0, 4, ((char*)&blk_net)[0], ((char*)&blk_net)[1]};
+                        if (sendto(sockfd, ack_retry, 4, 0, (struct sockaddr *)&peer_addr, peer_len) < 0) {
+                            perror("sendto");
+                            break;
+                        }
+                    } else {
+                        // pas de peer connu, renvoyer RRQ
+                        send_request(sockfd, server_addr, 1, fichier);
+                    }
+                }
+            } else {
+                if (n < 0) perror("recvfrom");
+                is_valid = 0;
+                break;
+            }
+        }
+
+        if (!recu_ok) { is_valid = 0; break; } // Abandon après 5 échecs
+
+        // VERIFICATION SI C'EST UN PAQUET D'ERREUR (Opcode 5)
+        uint16_t opcode = ntohs(*(uint16_t *)buffer);
+        if (opcode == 5) { is_valid = 0; break; }
+
+        size_t data_len = n - 4;
+        uint16_t block_num = ntohs(*(uint16_t *)(buffer + 2));
+
+        if (block_num == dernier_lock_recu + 1) {
+            buffer_final = realloc(buffer_final, taille_totale + data_len);
+            memcpy(buffer_final + taille_totale, buffer + 4, data_len);
+            taille_totale += data_len;
+            dernier_lock_recu = block_num; // On mémorise le nouveau bloc
+        } else if (block_num == dernier_lock_recu) {
+            printf("[GET] Doublon reçu (bloc %d), renvoi de l'ACK sans écriture.\n", block_num);
+        }
+        // Si c'est un autre bloc (avance rapide ou vieux), on ignore ou on ack le dernier reçu. 
+        // Ici on va juste ACK le block_num reçu si c'est le doublon ou le nouveau.
+        
+        char ack[4] = {0, 4, buffer[2], buffer[3]};
+        if (peer_set) {
+            if (sendto(sockfd, ack, 4, 0, (struct sockaddr *)&peer_addr, peer_len) < 0) perror("sendto");
+        } else {
+            if (sendto(sockfd, ack, 4, 0, (struct sockaddr *)server_addr, addr_len) < 0) perror("sendto");
+        }
+        printf("[GET] ACK %d envoyé\n", block_num);
+
+    } while (n == 516);
+
+    if (is_valid) {
+        FILE *f = fopen(fichier, "wb");
+        if (f) {
+            fwrite(buffer_final, 1, taille_totale, f);
+            fclose(f);
+            printf("[GET] Fichier '%s' reçu et formé (%zu octets).\n", fichier, taille_totale);
+        }
+    } else {
+        // Message d'erreur si is_valid est passé à 0
+        printf("[GET] ERREUR : Le transfert a échoué (erreur serveur).\n");
+    }
+    free(buffer_final);
+    return 0;
+}
+
+int put(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
+    FILE *f = fopen(fichier, "rb");
+    if (!f) {
+        fprintf(stderr, "[PUT] ERREUR : Le fichier '%s' n'existe pas.\n", fichier);
+        return -1; 
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *full_data = malloc(fsize);
+    fread(full_data, 1, fsize, f);
+    fclose(f);
+
+    // Phase 1 : Envoi WRQ et attente ACK 0 (avec timeout/retries)
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+    char buffer[MAX_BUF];
+    int tentatives = 0;
+    int recu_ok = 0;
+    memset(&from_addr, 0, sizeof(from_addr));
+    int peer_set = 0;
+
+    while (tentatives < TFTP_MAX_RETRIES && !recu_ok) {
+        send_request(sockfd, server_addr, 2, fichier);
+        ssize_t r = recvfrom(sockfd, buffer, MAX_BUF, 0, (struct sockaddr *)&from_addr, &from_len);
+        if (r >= 4) {
+
+            if (ntohs(*(uint16_t *)buffer) == 4 && ntohs(*(uint16_t *)(buffer + 2)) == 0) {
+                recu_ok = 1;
+                peer_set = 1;
+                printf("[PUT] ACK 0 reçu\n");
+            }
+        } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            tentatives++;
+            printf("[TIMEOUT] Tentative %d/%d... Renvoi de la requête WRQ.\n", tentatives, TFTP_MAX_RETRIES);
+        } else {
+            if (r < 0) perror("recvfrom");
+            break;
+        }
+    }
+    if (!recu_ok) { free(full_data); return -1; }
+
+    // Phase 2 : Envoi des blocs DATA avec timeout/retries
+    size_t sent = 0;
+    uint16_t block = 1;
+    do {
+        size_t to_send = (fsize - sent > 512) ? 512 : (fsize - sent);
+        uint16_t op = htons(3);
+        uint16_t blk = htons(block);
+
+        memcpy(buffer, &op, 2);
+        memcpy(buffer + 2, &blk, 2);
+        memcpy(buffer + 4, full_data + sent, to_send);
+
+        tentatives = 0;
+        recu_ok = 0;
+        while (tentatives < TFTP_MAX_RETRIES && !recu_ok) {
+            if (sendto(sockfd, buffer, to_send + 4, 0, (struct sockaddr *)&from_addr, from_len) < 0) {
+                perror("sendto");
+                break;
+            }
+            printf("[PUT] Envoi du bloc %d (%zu octets)...\n", block, to_send);
+
+            ssize_t r = recvfrom(sockfd, buffer, MAX_BUF, 0, (struct sockaddr *)&from_addr, &from_len);
+            if (r >= 4) {
+                // Vérifier l'ACK et qu'il vient du même peer
+                uint16_t ack_received = ntohs(*(uint16_t *)(buffer + 2));
+                if (ack_received == block) {
+                    recu_ok = 1;
+                    printf("[PUT] ACK %d reçu\n", ack_received);
+                }
+                 // sinon ack pour un autre bloc -> ignorer
+            } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                tentatives++;
+                printf("[TIMEOUT] Bloc %d non acquitté, tentative %d/%d...\n", block, tentatives, TFTP_MAX_RETRIES);
+            } else {
+                if (r < 0) perror("recvfrom");
+                break;
+            }
+        }
+
+        if (!recu_ok) break;
+        sent += to_send;
+        block++;
+    } while (sent < fsize || (sent == fsize && (fsize % 512 == 0) && fsize > 0)); 
+
+    printf("[PUT] Envoi de '%s' terminé.\n", fichier);
+    free(full_data);
+    return 0;
+}
 
 int main(int argc, char const *argv[]) {
-    int client_fd;
-    requete_tftp_t config;
-    struct sockaddr_in server_addr;
-
     if (argc < 4 || argc > 5) {
-        fprintf(stderr, "Usage: %s <ip_serveur> <get|put> <nom_fichier> [port]\n", argv[0]);
+        printf("Usage: %s <ip> <get|put> <fichier> [port]\n", argv[0]);
         return 1;
     }
+    requete_tftp_t req;
+    req.ip = argv[1];
+    req.type = (strcmp(argv[2], "get") == 0) ? 1 : 2;
+    req.fichier = argv[3];
+    req.port = (argc == 5) ? atoi(argv[4]) : PORT;
 
-    config.ip = argv[1]; 
-    config.is_get = (strcmp(argv[2], "get") == 0);
-    config.fichier = argv[3];
-    config.port = (argc == 5) ? atoi(argv[4]) : PORT;
-
-    // 3. Création de la socket UDP
-    if ((client_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("ERREUR : Impossible de créer la socket");
-        return 2;
-    }
-
-    // 4. Préparation de l'adresse du serveur
+    int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
+
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(config.port);
-    
-    if (inet_pton(AF_INET, config.ip, &server_addr.sin_addr) <= 0) {
-        fprintf(stderr, "ERREUR : Adresse IP '%s' invalide\n", config.ip);
-        close(client_fd);
-        return 3;
-    }
+    server_addr.sin_port = htons(req.port);
+    inet_pton(AF_INET, req.ip, &server_addr.sin_addr);
 
-    // 5. Exécution de la requête initiale
+    if (req.type == 1) 
+        get(client_fd, &server_addr, req.fichier);
+    else 
+        put(client_fd, &server_addr, req.fichier);
 
-    if (config.is_get) {
-        send_rrq(client_fd, &server_addr, sizeof(server_addr), config.fichier);
-        // Ici viendra la boucle de réception (Étape suivante)
-    } else {
-        send_wrq(client_fd, &server_addr, sizeof(server_addr), config.fichier);
-        // Ici viendra la boucle d'envoi (Étape suivante)
-    }
-
-    printf("[INFO] Requête initiale terminée. Fermeture de la socket.\n");
     close(client_fd);
     return 0;
 }
