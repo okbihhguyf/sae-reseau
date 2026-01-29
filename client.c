@@ -8,7 +8,7 @@
 
 #define PORT 69
 #define MAX_BUF 516 // 512 octets de données + 4 octets d'en-tête
-#define REPERTOIRE "SAE/TFTP/"
+
 
 typedef struct {
     const char *ip;           
@@ -64,7 +64,7 @@ void send_wrq(int sockfd, struct sockaddr_in *server_addr, socklen_t addr_len, c
     }
 }
 
-// --- Programme Principal ---
+
 
 int main(int argc, char const *argv[]) {
     int client_fd;
